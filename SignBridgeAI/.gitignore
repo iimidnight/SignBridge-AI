@@ -1,0 +1,16 @@
+
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.streamlit/secrets.toml
+.DS_Store
+
+# Generated datasets and extracted features
+dataset_raw/
+data/
+*.csv
+
+# Trained model files
+models/*.pkl
+models/*.joblib
