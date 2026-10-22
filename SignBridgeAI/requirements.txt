@@ -1,0 +1,11 @@
+
+streamlit
+opencv-python
+mediapipe==0.10.21
+numpy
+scikit-learn
+joblib
+pandas
+streamlit-webrtc==0.79.0
+streamlit-autorefresh
+av
