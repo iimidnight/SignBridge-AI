@@ -4,10 +4,9 @@ import joblib
 import numpy as np
 import mediapipe as mp
 
-MODEL_PATH = "models/isl_sign_model.pkl"
+MODEL_PATH = "models/isl_sign_model_v2.pkl"
 
-saved = joblib.load(MODEL_PATH)
-model = saved["model"]
+model = joblib.load(MODEL_PATH)
 
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils

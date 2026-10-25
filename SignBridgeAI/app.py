@@ -4,39 +4,113 @@ import cv2
 import joblib
 import numpy as np
 import mediapipe as mp
+
 from pathlib import Path
 from queue import Queue, Empty
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 from streamlit_autorefresh import st_autorefresh
-MODEL_PATH = Path("models/isl_sign_model.pkl")
+
+
+st.set_page_config(
+    page_title="SignBridge AI",
+    page_icon="🤟",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "models" / "isl_sign_model_v2.pkl"
+
+VALID_LABELS = set("123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
 
 @st.cache_resource
-def load_sign_model():
-    if not MODEL_PATH.exists():
+def load_sign_model(model_path):
+    if not model_path.is_file():
+        print("MODEL FILE NOT FOUND:", model_path)
         return None
-    saved = joblib.load(MODEL_PATH)
-    return saved["model"]
 
-model = load_sign_model()
+    saved = joblib.load(model_path)
+
+    # Support a direct classifier or a dictionary containing a model.
+    if isinstance(saved, dict):
+        saved = saved.get("model")
+
+    if saved is None or not hasattr(saved, "predict"):
+        print("ERROR: Saved file does not contain a usable model.")
+        return None
+
+    return saved
+
+
+model = load_sign_model(MODEL_PATH)
+
+if model is not None:
+    print("MODEL LOADED:", MODEL_PATH)
+    print("MODEL CLASSES:", sorted(str(c) for c in model.classes_))
+    print("MODEL FEATURE COUNT:", model.n_features_in_)
+
+    if model.n_features_in_ != 126:
+        st.error(
+            "The model expects a different number of features. "
+            "Expected 126."
+        )
+        model = None
+
+    elif not set(str(c) for c in model.classes_).issubset(VALID_LABELS):
+        st.error(
+            "The selected model contains labels outside A-Z and 1-9."
+        )
+        model = None
+
+
 mp_hands = mp.solutions.hands
 
-# Keep the prediction queue alive between Streamlit reruns.
+
+# --------------------------------------------------
+# SESSION STATE
+# --------------------------------------------------
+
 if "prediction_queue" not in st.session_state:
     st.session_state.prediction_queue = Queue()
 
 prediction_queue = st.session_state.prediction_queue
 
+if "sentence" not in st.session_state:
+    st.session_state.sentence = ""
+
+
+
+def undo_sentence():
+    sentence = st.session_state.get("sentence", "")
+    words = sentence.split()
+
+    if words:
+        st.session_state.sentence = " ".join(words[:-1])
+
+
+def clear_sentence():
+    st.session_state.sentence = ""
+
+
+# --------------------------------------------------
+# LIVE SIGN PROCESSOR
+# --------------------------------------------------
 
 class SignProcessor(VideoProcessorBase):
+
     def __init__(self, result_queue):
         self.result_queue = result_queue
+
         self.hands = mp.solutions.hands.Hands(
-    static_image_mode=False,
-    max_num_hands=2,
-    model_complexity=0,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
-)
+            static_image_mode=False,
+            max_num_hands=2,
+            model_complexity=0,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
         self.last_label = None
         self.stable_count = 0
         self.no_hand_count = 0
@@ -46,10 +120,19 @@ class SignProcessor(VideoProcessorBase):
         frame = video_frame.to_ndarray(format="bgr24")
 
         frame = cv2.resize(
-        frame,
-    (640, 480),
-    interpolation=cv2.INTER_AREA
-)
+            frame,
+            (640, 480),
+            interpolation=cv2.INTER_AREA,
+        )
+
+        # Mirror the camera view.
+        frame = cv2.flip(frame, 1)
+
+        if model is None:
+            return av.VideoFrame.from_ndarray(
+                frame, format="bgr24"
+            )
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.hands.process(rgb)
 
@@ -61,75 +144,133 @@ class SignProcessor(VideoProcessorBase):
                 xs = [point.x for point in hand.landmark]
                 hand_data.append((sum(xs) / len(xs), hand))
 
+            # Sort hands from left to right.
             hand_data.sort(key=lambda item: item[0])
+
             features = []
 
+            # Two hands × 21 landmarks × x/y/z = 126 features.
             for i in range(2):
                 if i < len(hand_data):
                     for point in hand_data[i][1].landmark:
-                        features.extend([point.x, point.y, point.z])
+                        features.extend([
+                            point.x,
+                            point.y,
+                            point.z,
+                        ])
                 else:
                     features.extend([0.0] * 63)
 
+            if len(features) != 126:
+                print("Unexpected feature count:", len(features))
+                return av.VideoFrame.from_ndarray(
+                    frame, format="bgr24"
+                )
+
             prediction = model.predict(
-                np.array(features).reshape(1, -1)
+                np.array(
+                    features,
+                    dtype=np.float32,
+                ).reshape(1, -1)
             )[0]
 
-            if prediction == self.last_label:
-                self.stable_count += 1
-            else:
-                self.last_label = prediction
-                self.stable_count = 1
+            prediction = str(prediction).strip()
+            print("MODEL PREDICTION:", repr(prediction))
 
-            # Add a sign only after it remains stable for several frames.
-            if (
-                self.stable_count >= 10
-                and prediction != self.last_emitted_label
-            ):
-                self.result_queue.put(prediction)
-                self.last_emitted_label = prediction
+            # Reject labels outside the supported vocabulary.
+            if prediction not in VALID_LABELS:
+                print("INVALID PREDICTION:", repr(prediction))
+                self.stable_count = 0
+                self.last_label = None
+
+            else:
+                if prediction == self.last_label:
+                    self.stable_count += 1
+                else:
+                    self.last_label = prediction
+                    self.stable_count = 1
+
+                # Emit a prediction after 10 stable frames.
+                if (
+                    self.stable_count >= 10
+                    and prediction != self.last_emitted_label
+                ):
+                    self.result_queue.put(prediction)
+                    self.last_emitted_label = prediction
 
         else:
             self.no_hand_count += 1
             self.stable_count = 0
             self.last_label = None
 
-            # Releasing both hands allows the same sign to be added again.
+            # Move hands out of view before repeating a sign.
             if self.no_hand_count >= 5:
                 self.last_emitted_label = None
 
-        return av.VideoFrame.from_ndarray(frame, format="bgr24")
+        return av.VideoFrame.from_ndarray(
+            frame, format="bgr24"
+        )
 
 
-st.set_page_config(
-    page_title="SignBridge AI",
-    page_icon="🤟",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# --------------------------------------------------
+# STYLING
+# --------------------------------------------------
 
 st.markdown("""
 <style>
-:root { color-scheme: dark; }
+:root {
+    color-scheme: dark;
+}
+
 .stApp {
-    background: linear-gradient(135deg, #090909 0%, #151515 55%, #090909 100%);
+    background: linear-gradient(
+        135deg, #090909 0%, #151515 55%, #090909 100%
+    );
     color: #edf3ff;
 }
-.block-container { padding-top: 2rem; padding-bottom: 3rem; max-width: 1250px; }
+
+.block-container {
+    padding-top: 2rem;
+    padding-bottom: 3rem;
+    max-width: 1250px;
+}
+
 [data-testid="stSidebar"] {
     background: #101010;
     border-right: 1px solid rgba(148,163,184,.18);
 }
+
 .hero {
     padding: 1.7rem 1.8rem;
     border: 1px solid rgba(125,211,252,.25);
     border-radius: 22px;
-    background: linear-gradient(120deg, rgba(55,55,55,.45), rgba(28,28,28,.65));
+    background: linear-gradient(
+        120deg, rgba(55,55,55,.45), rgba(28,28,28,.65)
+    );
     margin-bottom: 1.2rem;
 }
-.hero-kicker { color: #7dd3fc; font-size: .82rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
-.hero h1 { color: #f8fbff; font-size: 2.5rem; margin: .35rem 0 .45rem 0; }
-.hero p { color: #c8d7ec; font-size: 1.05rem; margin: 0; max-width: 760px; }
+
+.hero-kicker {
+    color: #7dd3fc;
+    font-size: .82rem;
+    font-weight: 700;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+}
+
+.hero h1 {
+    color: #f8fbff;
+    font-size: 2.5rem;
+    margin: .35rem 0 .45rem 0;
+}
+
+.hero p {
+    color: #c8d7ec;
+    font-size: 1.05rem;
+    margin: 0;
+    max-width: 760px;
+}
+
 .panel {
     background: rgba(22, 22, 22, .88);
     border: 1px solid rgba(148,163,184,.2);
@@ -137,16 +278,36 @@ st.markdown("""
     padding: 1.2rem 1.25rem;
     min-height: 180px;
 }
-.panel h3 { margin-top: 0; color: #f2f7ff; }
-.muted { color: #a9bad2; font-size: .92rem; }
+
+.panel h3 {
+    margin-top: 0;
+    color: #f2f7ff;
+}
+
+.muted {
+    color: #a9bad2;
+    font-size: .92rem;
+}
+
 .metric {
     background: rgba(22,22,22,.88);
     border: 1px solid rgba(148,163,184,.2);
     border-radius: 15px;
     padding: 1rem;
 }
-.metric-label { color: #a9bad2; font-size: .8rem; }
-.metric-value { color: #f8fbff; font-size: 1.25rem; font-weight: 700; margin-top: .25rem; }
+
+.metric-label {
+    color: #a9bad2;
+    font-size: .8rem;
+}
+
+.metric-value {
+    color: #f8fbff;
+    font-size: 1.25rem;
+    font-weight: 700;
+    margin-top: .25rem;
+}
+
 .pill {
     display: inline-block;
     border-radius: 999px;
@@ -157,175 +318,36 @@ st.markdown("""
     font-size: .78rem;
     font-weight: 700;
 }
-.small-note { color: #a9bad2; font-size: .82rem; }
+
+.small-note {
+    color: #a9bad2;
+    font-size: .82rem;
+}
+
 div.stButton > button {
     border-radius: 10px;
     min-height: 2.7rem;
     font-weight: 650;
 }
-</style>
-""", unsafe_allow_html=True)
 
-if "sentence" not in st.session_state:
-    st.session_state.sentence = ""
+/* Glass-style background and panels */
 
-with st.sidebar:
-    st.markdown("## 🤟 SignBridge AI")
-    st.caption("Accessible communication • Prototype")
-    st.divider()
-    st.markdown("### Project status")
-    st.markdown('<span class="pill">MODEL INTEGRATION PENDING</span>', unsafe_allow_html=True)
-    st.write("")
-    st.markdown("**Current stack**")
-    st.markdown("- Python")
-    st.markdown("- MediaPipe + OpenCV")
-    st.markdown("- scikit-learn")
-    st.markdown("- Streamlit")
-    st.divider()
-    st.markdown("**Prototype scope**")
-    st.caption("Limited-vocabulary static-sign recognition. This is not full ISL translation.")
-    st.markdown("**Accessibility principle**")
-    st.caption("Predictions should be visible, editable, and confirmed by the user.")
-
-    st.markdown("""
-    <div class="hero">
-    <div class="hero-kicker">Computer vision for inclusive communication</div>
-    <h1>SignBridge AI</h1>
-    <p>A prototype exploring how hand-landmark detection and machine learning can support recognition of a limited set of Indian Sign Language signs.</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-m1, m2, m3 = st.columns(3)
-with m1:
-    st.markdown('<div class="metric"><div class="metric-label">Recognition engine</div><div class="metric-value">Being connected</div></div>', unsafe_allow_html=True)
-with m2:
-    st.markdown('<div class="metric"><div class="metric-label">Vocabulary</div><div class="metric-value">Dataset pending</div></div>', unsafe_allow_html=True)
-with m3:
-    st.markdown('<div class="metric"><div class="metric-label">Output mode</div><div class="metric-value">Text → Speech planned</div></div>', unsafe_allow_html=True)
-
-st.write("")
-
-left, right = st.columns([1.05, 0.95], gap="medium")
-
-with left:
-    st.markdown(
-        '<div class="panel"><h3>📷 Live sign recognition</h3>'
-        '<p class="muted">Show one hand clearly with good lighting '
-        'and keep your hand inside the camera frame.</p></div>',
-        unsafe_allow_html=True
-    )
-
-    if model is None:
-        st.error("Model not found. Check models/isl_sign_model.pkl")
-    else:
-        st.markdown("### Live sign recognition")
-
-        webrtc_streamer(
-            key="signbridge-camera",
-            video_processor_factory=lambda: SignProcessor(prediction_queue),
-            media_stream_constraints={
-                "video": {
-                    "width": {"ideal": 640},
-                    "height": {"ideal": 480},
-                    "frameRate": {"ideal": 15, "max": 20},
-                },
-                "audio": False,
-            },
-            async_processing=True,
-        )
-
-    st.caption(
-        "Hold a sign steady to recognize it. "
-        "Briefly move both hands out of view before repeating the same sign."
-    )
-
-with right:
-    st.markdown(
-        '<div class="panel"><h3>💬 Sentence builder</h3>'
-        '<p class="muted">Your recognized signs will appear here.</p></div>',
-        unsafe_allow_html=True
-    )
-
-    if "sentence" not in st.session_state:
-        st.session_state.sentence = ""
-
-    st.session_state.sentence = st.text_area(
-        "Text output",
-        value=st.session_state.sentence,
-        placeholder="Recognized signs will appear here…",
-        height=115,
-        help="You can edit the sentence manually."
-    )
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        if st.button("↩ Undo last word", use_container_width=True):
-            words = st.session_state.sentence.split()
-            st.session_state.sentence = " ".join(words[:-1])
-            st.rerun()
-
-    with c2:
-        if st.button("Clear text", use_container_width=True):
-            st.session_state.sentence = ""
-            st.rerun()
-
-    if st.button("Copy sentence", use_container_width=True):
-        sentence = st.session_state.sentence.strip()
-
-        if sentence:
-            st.code(sentence, language=None)
-            st.caption("Select the text above and copy it.")
-        else:
-            st.info("Your sentence is empty.")
-
-# Refresh the dashboard and display newly recognized words.
-st_autorefresh(interval=1000, key="signbridge_refresh")
-
-while not prediction_queue.empty():
-    word = prediction_queue.get_nowait()
-    current = st.session_state.sentence.strip()
-    st.session_state.sentence = f"{current} {word}".strip()
-
-st.write("")
-st.markdown("### How it works")
-steps = st.columns(4)
-step_data = [
-    ("01", "Image input", "An image or webcam frame"),
-    ("02", "Landmarks", "MediaPipe detects hand keypoints"),
-    ("03", "Classifier", "Model predicts a known label"),
-    ("04", "Text output", "User reviews the prediction"),
-]
-for col, (num, title, desc) in zip(steps, step_data):
-    with col:
-        st.markdown(
-            f'<div class="metric"><div class="metric-label">{num}</div><div class="metric-value">{title}</div><p class="small-note">{desc}</p></div>',
-            unsafe_allow_html=True,
-        )
-
-st.info(
-    "Responsible-use note: sign languages use hand movement, facial expression, body posture, and context. "
-    "This prototype focuses on a limited set of static signs and may make mistakes; it should not be presented as a complete ISL translator."
-)
-
-st.markdown('<p class="small-note">SignBridge AI • Student open-source prototype • Dataset attribution will be added after dataset verification.</p>', unsafe_allow_html=True)
-
-
-st.markdown("""
-<style>
-/* Background: charcoal with soft white light */
 .stApp {
     background:
-        radial-gradient(ellipse at 12% 12%,
-            rgba(255,255,255,0.13), transparent 35%),
-        radial-gradient(ellipse at 88% 35%,
-            rgba(210,220,230,0.09), transparent 32%),
-        linear-gradient(135deg, #101010, #1b1b1b 50%, #090909)
-        !important;
+        radial-gradient(
+            ellipse at 12% 12%,
+            rgba(255,255,255,0.13), transparent 35%
+        ),
+        radial-gradient(
+            ellipse at 88% 35%,
+            rgba(210,220,230,0.09), transparent 32%
+        ),
+        linear-gradient(
+            135deg, #101010, #1b1b1b 50%, #090909
+        ) !important;
     background-attachment: fixed !important;
 }
 
-/* Frosted-glass panels and cards */
 .glass-panel,
 .metric-card,
 .hero,
@@ -341,24 +363,22 @@ st.markdown("""
         inset 0 1px 0 rgba(255,255,255,0.10) !important;
 }
 
-/* Sidebar: translucent glass */
 [data-testid="stSidebar"] {
     background: rgba(255,255,255,0.045) !important;
     backdrop-filter: blur(24px) !important;
     border-right: 1px solid rgba(255,255,255,0.14) !important;
 }
 
-/* White glass highlight on hover */
 .glass-panel:hover,
 .metric-card:hover {
     background: rgba(255,255,255,0.11) !important;
     border-color: rgba(255,255,255,0.30) !important;
-    box-shadow: 0 12px 38px rgba(0,0,0,0.28),
-                inset 0 1px 0 rgba(255,255,255,0.16) !important;
+    box-shadow:
+        0 12px 38px rgba(0,0,0,0.28),
+        inset 0 1px 0 rgba(255,255,255,0.16) !important;
     transition: all 0.25s ease;
 }
 
-/* Inputs */
 .stTextArea textarea,
 .stTextInput input {
     background: rgba(255,255,255,0.07) !important;
@@ -367,7 +387,6 @@ st.markdown("""
     border-radius: 14px !important;
 }
 
-/* Buttons */
 .stButton button {
     background: rgba(255,255,255,0.10) !important;
     color: #ffffff !important;
@@ -382,15 +401,307 @@ st.markdown("""
     border-color: rgba(255,255,255,0.48) !important;
 }
 
-/* Typography */
 .stApp, [data-testid="stSidebar"] {
     color: #f4f4f4;
 }
 
-/* Avoid unwanted blue focus accents */
 *:focus-visible {
     outline-color: rgba(255,255,255,0.65) !important;
 }
 </style>
 """, unsafe_allow_html=True)
 
+
+# --------------------------------------------------
+# SIDEBAR
+# --------------------------------------------------
+
+with st.sidebar:
+    st.markdown("## 🤟 SignBridge AI")
+    st.caption("Accessible communication")
+    st.divider()
+
+    st.markdown("### Project status")
+    st.markdown(
+        '<span class="pill">PROTOTYPE</span>',
+        unsafe_allow_html=True
+    )
+
+    st.write("")
+    st.markdown("**Technology stack**")
+    st.markdown(
+        "- Python\n"
+        "- MediaPipe + OpenCV\n"
+        "- scikit-learn\n"
+        "- Streamlit + WebRTC"
+    )
+
+    st.divider()
+    st.markdown("**Prototype scope**")
+    st.caption(
+        "Limited-vocabulary static-sign recognition. "
+        "This is not a complete ISL translator."
+    )
+
+    st.markdown("**Accessibility**")
+    st.caption(
+        "Predictions should be visible, editable, "
+        "and confirmed by the user."
+    )
+
+
+# --------------------------------------------------
+# NAVIGATION
+# --------------------------------------------------
+
+nav_left, nav_mid, nav_right = st.columns([2, 3, 1])
+
+with nav_left:
+    st.markdown(
+        '<div style="padding-top:8px;font-size:21px;'
+        'font-weight:750;color:#F5F7FF;">'
+        '🤟 SignBridge <span style="color:#8B9CFF;">AI</span>'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+with nav_mid:
+    st.markdown(
+        '<div style="padding-top:14px;text-align:center;'
+        'color:#B8C1D9;font-size:14px;">'
+        '<span style="color:#FFFFFF;font-weight:700;">Dashboard</span>'
+        '&nbsp;&nbsp;&nbsp; | &nbsp;&nbsp;&nbsp;'
+        'ISL Dictionary &nbsp;&nbsp;&nbsp; | &nbsp;&nbsp;&nbsp;'
+        'About'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+with nav_right:
+    st.markdown(
+        '<div style="text-align:right;padding-top:13px;'
+        'color:#A5E6C0;font-size:13px;">'
+        '● Prototype'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+st.write("")
+
+
+# --------------------------------------------------
+# HERO
+# --------------------------------------------------
+
+st.markdown("""
+<div class="hero">
+    <div class="hero-kicker">
+        ACCESSIBILITY • COMPUTER VISION • AI
+    </div>
+    <h1>SignBridge AI</h1>
+    <p>
+        Bridging communication through Indian Sign Language
+        recognition and editable text output.
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+
+# --------------------------------------------------
+# STATUS CARDS
+# --------------------------------------------------
+
+m1, m2, m3 = st.columns(3)
+
+with m1:
+    engine_status = (
+        "Model ready" if model is not None
+        else "Model unavailable"
+    )
+
+    st.markdown(
+        f'<div class="metric"><div class="metric-label">'
+        f'Recognition engine</div><div class="metric-value">'
+        f'{engine_status}</div></div>',
+        unsafe_allow_html=True
+    )
+
+with m2:
+    st.markdown(
+        '<div class="metric"><div class="metric-label">'
+        'Vocabulary</div><div class="metric-value">'
+        '35 labels: A-Z, 1-9</div></div>',
+        unsafe_allow_html=True
+    )
+
+with m3:
+    st.markdown(
+        '<div class="metric"><div class="metric-label">'
+        'Output mode</div><div class="metric-value">'
+        'Editable text</div></div>',
+        unsafe_allow_html=True
+    )
+
+st.write("")
+
+
+# --------------------------------------------------
+# MAIN DASHBOARD
+# --------------------------------------------------
+
+left, right = st.columns([1.05, 0.95], gap="medium")
+
+
+# --------------------------------------------------
+# LIVE SIGN RECOGNITION
+# --------------------------------------------------
+
+with left:
+    st.markdown(
+        '<div class="panel"><h3>📷 Live sign recognition</h3>'
+        '<p class="muted">Show one hand clearly with good lighting '
+        'and keep your hand inside the camera frame.</p></div>',
+        unsafe_allow_html=True
+    )
+
+    if model is None:
+        st.error(
+            "Model not loaded. Check that "
+            "models/isl_sign_model_v2.pkl exists."
+        )
+
+    else:
+        st.markdown("### Live sign recognition")
+
+        webrtc_streamer(
+            key="signbridge-camera-v2",
+            video_processor_factory=lambda: SignProcessor(
+                prediction_queue
+            ),
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "frameRate": {"ideal": 15, "max": 20},
+                },
+                "audio": False,
+            },
+            async_processing=True,
+        )
+
+    st.caption(
+        "Hold a sign steady to recognize it. "
+        "Briefly move both hands out of view before repeating "
+        "the same sign."
+    )
+
+
+# --------------------------------------------------
+# SENTENCE BUILDER
+# --------------------------------------------------
+
+with right:
+    st.markdown(
+        '<div class="panel"><h3>💬 Sentence builder</h3>'
+        '<p class="muted">Your recognized signs will appear here.</p></div>',
+        unsafe_allow_html=True
+    )
+
+    # Add new predictions before rendering the text area.
+    while not prediction_queue.empty():
+        try:
+            label = str(prediction_queue.get_nowait()).strip()
+
+            if label in VALID_LABELS:
+                current = st.session_state.sentence.strip()
+                st.session_state.sentence = (
+                    f"{current} {label}".strip()
+                )
+
+        except Empty:
+            break
+
+    # Text area
+    st.text_area(
+        "Text output",
+        key="sentence",
+        placeholder="Recognized letters and digits will appear here…",
+        height=115,
+        help="You can edit the output manually."
+    )
+
+    # Undo and Clear buttons
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.button(
+            "↩ Undo last sign",
+            use_container_width=True,
+            on_click=undo_sentence
+        )
+
+    with c2:
+        st.button(
+            "Clear text",
+            use_container_width=True,
+            on_click=clear_sentence
+        )
+
+    # Copy sentence button
+    if st.button("Copy sentence", use_container_width=True):
+        sentence = st.session_state.sentence.strip()
+
+        if sentence:
+            st.code(sentence, language=None)
+            st.caption("Select the text above and copy it.")
+        else:
+            st.info("Your output is empty.")
+
+
+# Refresh dashboard to display new predictions.
+st_autorefresh(interval=1000, key="signbridge_refresh")
+
+
+# --------------------------------------------------
+# HOW IT WORKS
+# --------------------------------------------------
+
+st.write("")
+st.markdown("### How it works")
+
+steps = st.columns(4)
+
+step_data = [
+    ("01", "Image input", "A webcam frame"),
+    ("02", "Landmarks", "MediaPipe detects hand keypoints"),
+    ("03", "Classifier", "Model predicts a known label"),
+    ("04", "Text output", "User reviews the prediction"),
+]
+
+for col, (num, title, desc) in zip(steps, step_data):
+    with col:
+        st.markdown(
+            f'<div class="metric"><div class="metric-label">'
+            f'{num}</div><div class="metric-value">{title}</div>'
+            f'<p class="small-note">{desc}</p></div>',
+            unsafe_allow_html=True,
+        )
+
+
+# --------------------------------------------------
+# RESPONSIBLE USE
+# --------------------------------------------------
+
+st.info(
+    "Responsible-use note: sign languages use hand movement, "
+    "facial expression, body posture, and context. This prototype "
+    "focuses on a limited set of static signs and may make mistakes; "
+    "it should not be presented as a complete ISL translator."
+)
+
+st.markdown(
+    '<p class="small-note">SignBridge AI • Student open-source '
+    'prototype • Dataset attribution will be added after '
+    'dataset verification.</p>',
+    unsafe_allow_html=True
+)
